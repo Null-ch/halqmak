@@ -1,0 +1,20 @@
+[Unit]
+Description=Halqmak Telegram bot
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=halqmak
+Group=halqmak
+WorkingDirectory=/opt/halqmak
+EnvironmentFile=/opt/halqmak/.env
+ExecStart=/opt/halqmak/.venv/bin/python /opt/halqmak/bot.py
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target

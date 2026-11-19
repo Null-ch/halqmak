@@ -62,7 +62,7 @@ class Panel:
 
     def create(self, username, squad):
         try:
-            return self.call("POST", "/users", json={
+            user = self.call("POST", "/users", json={
                 "username": username,
                 "status": "ACTIVE",
                 "tag": TAG,
@@ -79,9 +79,27 @@ class Panel:
                 user = self.call("GET", f"/users/by-username/{username}")
             except ApiError:
                 raise error from None
-            if user.get("username") == username and user.get("tag") == TAG:
+            if user.get("username") != username or user.get("tag") != TAG:
+                raise error
+        return self.rename_to_id(user)
+
+    def rename_to_id(self, user):
+        user_id = user.get("id")
+        if type(user_id) is not int or user_id <= 0:
+            LOG.warning("Panel did not return a numeric ID for %s", user["username"])
+            return user
+        username = f"go_{user_id}"
+        try:
+            updated = self.call("PATCH", "/users", json={"id": user_id, "username": username})
+        except ApiError as error:
+            LOG.warning("Could not confirm rename for ID %s (%s)", user_id, error)
+            try:
+                updated = self.call("GET", f"/users/{user_id}")
+            except ApiError:
                 return user
-            raise error
+        if updated.get("id") == user_id:
+            return {**user, **updated}
+        return user
 
     def active(self):
         start = 0
@@ -217,7 +235,7 @@ class Bot:
         users, failures = [], []
         last_update = time.monotonic()
         for index in range(1, count + 1):
-            username = f"go-{code}-{index:03d}"
+            username = f"go_pending_{code}_{index:03d}"
             try:
                 users.append(self.panel.create(username, squad))
             except ApiError as error:
@@ -237,6 +255,9 @@ class Bot:
         skipped = count - len(users) - len(failures)
         if skipped:
             title += f"\nПропущено: {skipped}"
+        pending = sum(user["username"].startswith("go_pending_") for user in users)
+        if pending:
+            title += f"\nС временным именем: {pending}"
         missing = sum(not subscription(user) for user in users)
         if missing:
             title += f"\nБез ссылки в ответе панели: {missing}"

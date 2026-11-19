@@ -234,8 +234,9 @@ class Bot:
         for caption, columns, entries in tables:
             if caption:
                 blocks.append({"type": "heading", "text": caption, "size": 4})
-            cells = [[{"text": text, "is_header": True} for text in columns]]
-            cells.extend([{"text": value if isinstance(value, (dict, list)) else str(value)}
+            cells = [[{"text": text, "is_header": True, "align": "left"} for text in columns]]
+            cells.extend([{"text": value if isinstance(value, (dict, list)) else str(value),
+                           "align": "left", "valign": "middle"}
                           for value in row] for row in entries)
             blocks.append({"type": "table", "cells": cells, "is_compact": True})
         content = {"blocks": blocks}
@@ -379,10 +380,9 @@ class Bot:
             data.append(("Внешний сквад", self.panel.external_squad(uuid)))
         url = subscription(user)
         if url:
-            links = [table_button("Открыть", url=url)]
+            data.append(("Подписка", table_button("Открыть", url=url)))
             if len(url) <= 256:
-                links.extend(["\n", table_button("Копировать", copy_text={"text": url})])
-            data.append(("Подписка", links))
+                data.append(("", table_button("Копировать", copy_text={"text": url})))
         extra_tables = []
         if devices:
             device_rows = [
@@ -400,11 +400,10 @@ class Bot:
         else:
             data.append(("Устройства HWID", "Нет устройств" if devices == [] else "Данные недоступны"))
         rows = []
-        actions = []
         if user.get("status") != "DISABLED":
-            actions.append(button("Деактивировать", f"action:disable:{user_id}:{page}"))
-        actions.append(button("Удалить", f"action:delete:{user_id}:{page}", "danger"))
-        rows.extend([actions, [self.back_to_list(chat, page), button("Меню", "menu")]])
+            rows.append([button("Деактивировать", f"action:disable:{user_id}:{page}")])
+        rows.append([button("Удалить", f"action:delete:{user_id}:{page}", "danger")])
+        rows.append([self.back_to_list(chat, page), button("Меню", "menu")])
         return self.table(chat, user["username"], ("Поле", "Значение"), data, rows, message,
                           extra_tables=extra_tables)
 

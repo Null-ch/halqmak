@@ -14,6 +14,12 @@ from dotenv import load_dotenv
 TAG = "GO"
 PAGE_SIZE = 8
 STATUSES = {"ACTIVE": "Активна", "DISABLED": "Отключена", "LIMITED": "Лимит исчерпан", "EXPIRED": "Истекла"}
+MENU_KEYS = (
+    (("Создать одну", "count:1"), ("Создать 20", "count:20")),
+    (("Своё количество", "custom"),),
+    (("Активные GO", "active"), ("Все GO", "all")),
+)
+MENU_ACTIONS = {label: action for row in MENU_KEYS for label, action in row}
 LOG = logging.getLogger("halqmak")
 
 
@@ -259,17 +265,16 @@ class Bot:
                 fallback_rows.append(buttons)
         return self.screen(chat, "\n".join(lines)[:3900], fallback_rows + rows, message)
 
-    def menu(self, chat, message=None):
+    def menu(self, chat):
         self.inputs.pop(chat, None)
         self.actions.pop(chat, None)
         self.confirmations.pop(chat, None)
-        self.screen(chat, "Управление подписками GO", [
-            [button("Создать одну", "count:1", "primary"),
-             button("Создать 20", "count:20", "primary")],
-            [button("Своё количество", "custom")],
-            [button("Активные подписки GO", "active")],
-            [button("Все подписки GO", "all")],
-        ], message)
+        return self.call("sendMessage", chat_id=chat, text="Управление подписками GO",
+                         protect_content=True, reply_markup={
+                             "keyboard": [[{"text": label} for label, _ in row] for row in MENU_KEYS],
+                             "resize_keyboard": True,
+                             "is_persistent": True,
+                         })
 
     def confirm(self, chat, count, message=None):
         self.inputs.pop(chat, None)
@@ -519,24 +524,27 @@ class Bot:
                     raise
         if not allowed:
             return
-        if not callback:
+        if callback:
+            action = callback.get("data", "")
+            message_id = message["message_id"]
+        else:
             value = message.get("text", "").strip()
             command = value.split(maxsplit=1)[0].split("@")[0] if value else ""
             if command in {"/start", "/menu", "/cancel"}:
                 return self.menu(chat)
-            state = self.inputs.get(chat)
-            if state and state[0] == "count":
+            action = MENU_ACTIONS.get(value)
+            message_id = None
+            if action is None and chat in self.inputs:
                 if value.isascii() and value.isdecimal() and len(value) <= 3:
                     count = int(value)
                     if 1 <= count <= self.max_batch:
                         return self.confirm(chat, count)
                 return self.screen(chat, f"Введите целое число от 1 до {self.max_batch}.",
                                    [[button("Отмена", "menu")]])
-            return
-        action = callback.get("data", "")
-        message_id = message["message_id"]
+            if action is None:
+                return
         if action == "menu":
-            return self.menu(chat, message_id)
+            return self.menu(chat)
         if action == "custom":
             self.confirmations.pop(chat, None)
             self.actions.pop(chat, None)
@@ -551,7 +559,9 @@ class Bot:
             self.inputs.pop(chat, None)
             self.confirmations.pop(chat, None)
             self.actions.pop(chat, None)
-            self.screen(chat, "Загружаю подписки GO…", message=message_id)
+            progress = self.screen(chat, "Загружаю подписки GO…", message=message_id)
+            if message_id is None:
+                message_id = progress["message_id"]
             users = list(self.panel.users(active_only=action == "active"))
             title = "Активные подписки GO" if action == "active" else "Все подписки GO"
             return self.results(chat, f"{title}: {len(users)}", users, message_id)

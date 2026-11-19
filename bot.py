@@ -2,9 +2,11 @@ import csv
 import io
 import logging
 import os
+import re
 import secrets
 import time
 from datetime import datetime, timezone
+from html import escape
 from urllib.parse import urlsplit
 
 import requests
@@ -13,6 +15,8 @@ from dotenv import load_dotenv
 
 TAG = "GO"
 PAGE_SIZE = 8
+PREFIX = re.compile(r"[a-z0-9][a-z0-9_-]{0,15}")
+STATUSES = {"ACTIVE": "Активна", "DISABLED": "Отключена", "LIMITED": "Лимит исчерпан", "EXPIRED": "Истекла"}
 LOG = logging.getLogger("halqmak")
 
 
@@ -39,6 +43,8 @@ class Api:
             )
             if not 200 <= response.status_code < 300:
                 raise ApiError(self.name, response.status_code)
+            if response.status_code == 204:
+                return {}
             return response.json()
         except (requests.RequestException, ValueError):
             raise ApiError(self.name) from None
@@ -60,7 +66,7 @@ class Panel:
             raise ValueError("В панели должен быть ровно один внутренний сквад GO.")
         return matches[0]
 
-    def create(self, username, squad):
+    def create(self, username, squad, prefix=""):
         try:
             user = self.call("POST", "/users", json={
                 "username": username,
@@ -81,14 +87,14 @@ class Panel:
                 raise error from None
             if user.get("username") != username or user.get("tag") != TAG:
                 raise error
-        return self.rename_to_id(user)
+        return self.rename_to_id(user, prefix)
 
-    def rename_to_id(self, user):
+    def rename_to_id(self, user, prefix):
         user_id = user.get("id")
         if type(user_id) is not int or user_id <= 0:
             LOG.warning("Panel did not return a numeric ID for %s", user["username"])
             return user
-        username = f"go_{user_id}"
+        username = f"go_{prefix}_{user_id}" if prefix else f"go_{user_id}"
         try:
             updated = self.call("PATCH", "/users", json={"id": user_id, "username": username})
         except ApiError as error:
@@ -101,21 +107,61 @@ class Panel:
             return {**user, **updated}
         return user
 
-    def active(self):
+    def users(self, active_only=True):
         start = 0
         now = datetime.now(timezone.utc)
         while True:
             page = self.call("GET", "/users", params={"start": start, "size": 250})
             users = page["users"]
             for user in users:
-                if user.get("tag") != TAG or user.get("status") != "ACTIVE":
+                if user.get("tag") != TAG:
                     continue
-                expires = datetime.fromisoformat(user["expireAt"].replace("Z", "+00:00"))
-                if expires > now:
-                    yield user
+                if active_only:
+                    expires = datetime.fromisoformat(user["expireAt"].replace("Z", "+00:00"))
+                    if user.get("status") != "ACTIVE" or expires <= now:
+                        continue
+                yield user
             start += len(users)
             if not users or start >= page["total"]:
                 return
+
+    def go_user(self, user_id):
+        try:
+            user = self.call("GET", f"/users/{user_id}")
+        except ApiError as error:
+            if error.status == 404:
+                return None
+            raise
+        return user if user.get("id") == user_id and user.get("tag") == TAG else None
+
+    def devices(self, user_id):
+        try:
+            result = self.call("GET", f"/hwid/devices/{user_id}")
+        except ApiError as error:
+            LOG.warning("HWID list unavailable (%s)", error)
+            return None
+        return result.get("devices")
+
+    def external_squad(self, uuid):
+        try:
+            return self.call("GET", f"/external-squads/{uuid}").get("name") or uuid
+        except ApiError:
+            return uuid
+
+    def change(self, user_id, action):
+        user = self.go_user(user_id)
+        if user is None:
+            return None
+        if action == "disable":
+            if user.get("status") != "DISABLED":
+                self.call("POST", f"/users/{user_id}/actions/disable")
+        elif action == "delete":
+            result = self.call("DELETE", f"/users/{user_id}")
+            if result.get("isDeleted") is False:
+                raise ApiError("Remnawave")
+        else:
+            raise ValueError("Unsupported account action")
+        return user
 
 
 def button(text, action, style=None):
@@ -130,6 +176,22 @@ def subscription(user):
     return url if urlsplit(url).scheme in {"https", "http"} and urlsplit(url).hostname else ""
 
 
+def utc_date(value):
+    if not value:
+        return "—"
+    date = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return date.astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
+
+
+def traffic(value):
+    if value is None:
+        return "—"
+    for unit in ("Б", "КиБ", "МиБ", "ГиБ", "ТиБ"):
+        if value < 1024 or unit == "ТиБ":
+            return f"{value:.3g} {unit}"
+        value /= 1024
+
+
 class Bot:
     def __init__(self, telegram, panel, admins, max_batch):
         self.telegram = telegram
@@ -137,7 +199,8 @@ class Bot:
         self.admins = admins
         self.max_batch = max_batch
         self.confirmations = {}
-        self.custom = set()
+        self.inputs = {}
+        self.actions = {}
         self.views = {}
 
     def call(self, method, request_timeout=15, **payload):
@@ -157,20 +220,51 @@ class Bot:
             return self.call("editMessageText", message_id=message, **payload)
         return self.call("sendMessage", protect_content=True, **payload)
 
+    def table(self, chat, title, headers, data, rows, message=None):
+        headings = "".join(f"<th>{escape(str(value))}</th>" for value in headers)
+        body = "".join(
+            "<tr>" + "".join(f"<td>{escape(str(value))}</td>" for value in row) + "</tr>"
+            for row in data
+        )
+        content = {"html": f"<h3>{escape(title)}</h3><table><tr>{headings}</tr>{body}</table>"}
+        payload = {"chat_id": chat, "rich_message": content, "reply_markup": {"inline_keyboard": rows}}
+        try:
+            if message is not None:
+                return self.call("editMessageText", message_id=message, **payload)
+            return self.call("sendRichMessage", protect_content=True, **payload)
+        except ApiError as error:
+            if error.status not in {400, 404}:
+                raise
+        plain = "\n".join(" · ".join(map(str, row)) for row in data)
+        return self.screen(chat, (title + "\n\n" + plain)[:3900], rows, message)
+
     def menu(self, chat, message=None):
-        self.custom.discard(chat)
+        self.inputs.pop(chat, None)
+        self.actions.pop(chat, None)
         self.confirmations.pop(chat, None)
         self.screen(chat, "Управление подписками GO", [
             [button("Создать одну", "count:1", "primary"),
              button("Создать 20", "count:20", "primary")],
             [button("Своё количество", "custom")],
             [button("Активные подписки GO", "active")],
+            [button("Все подписки GO", "all")],
         ], message)
 
-    def confirm(self, chat, count, message=None):
+    def ask_prefix(self, chat, count, message=None):
+        self.confirmations.pop(chat, None)
+        self.actions.pop(chat, None)
+        token = secrets.token_hex(6)
+        self.inputs[chat] = ("prefix", count, token)
+        return self.screen(chat, "Отправьте префикс, например us для go_us_1234. "
+                           "До 16 символов: латинские буквы, цифры, дефис и подчёркивание.",
+                           [[button("Без префикса", f"default:{token}"), button("Отмена", "menu")]], message)
+
+    def confirm(self, chat, count, prefix, message=None):
+        self.inputs.pop(chat, None)
         code = secrets.token_hex(8)
-        self.confirmations[chat] = (code, count)
-        self.screen(chat, f"Создать учётные записи: {count}\nТег и сквад: GO\nСрок в панели: до {self.panel.expiry[:10]}", [
+        self.confirmations[chat] = (code, count, prefix)
+        pattern = f"go_{prefix}_<id>" if prefix else "go_<id>"
+        self.screen(chat, f"Создать учётные записи: {count}\nНики: {pattern}\nТег и сквад: GO\nСрок в панели: до {self.panel.expiry[:10]}", [
             [button("Создать", f"create:{code}", "success"), button("Отмена", "menu")],
         ], message)
 
@@ -185,15 +279,17 @@ class Bot:
         if not 0 <= index < pages:
             return
         rows = []
-        for user in users[index * PAGE_SIZE:(index + 1) * PAGE_SIZE]:
+        entries = users[index * PAGE_SIZE:(index + 1) * PAGE_SIZE]
+        for user in entries:
             url = subscription(user)
-            if not url:
-                rows.append([button(user["username"] + " · ссылка отсутствует", "noop")])
-                continue
-            row = [{"text": user["username"], "url": url}]
-            if len(url) <= 256:
+            user_id = user.get("id")
+            row = [button(user["username"], f"card:{user_id}:{index}")] if user_id else []
+            if url and len(url) <= 256:
                 row.append({"text": "Копировать", "copy_text": {"text": url}})
-            rows.append(row)
+            elif url:
+                row.append({"text": "Открыть ссылку", "url": url})
+            if row:
+                rows.append(row)
         navigation = []
         if index:
             navigation.append(button("←", f"page:{code}:{index - 1}"))
@@ -205,7 +301,11 @@ class Bot:
             rows.append([button("Скачать CSV", f"csv:{code}"), button("Меню", "menu")])
         else:
             rows.append([button("Меню", "menu")])
-        self.screen(chat, f"{title}\nСтраница {index + 1} из {pages}", rows, message)
+        heading = f"{title}\nСтраница {index + 1} из {pages}"
+        if not entries:
+            return self.screen(chat, heading, rows, message)
+        data = [(user["username"], user.get("id", "—"), STATUSES.get(user.get("status"), "—")) for user in entries]
+        return self.table(chat, heading, ("Ник", "ID", "Статус"), data, rows, message)
 
     def results(self, chat, title, users, message=None):
         code = secrets.token_hex(6)
@@ -224,20 +324,119 @@ class Bot:
                            data={"chat_id": str(chat), "protect_content": "true"},
                            files={"document": ("GO.csv", buffer.getvalue().encode("utf-8-sig"), "text/csv")})
 
+    def back_to_list(self, chat, page):
+        current = self.views.get(chat)
+        if current:
+            code, _, users = current
+            last = max(0, (len(users) - 1) // PAGE_SIZE)
+            return button("← К списку", f"page:{code}:{min(page, last)}")
+        return button("Все подписки GO", "all")
+
+    def card(self, chat, user_id, page, message):
+        self.inputs.pop(chat, None)
+        self.confirmations.pop(chat, None)
+        self.actions.pop(chat, None)
+        user = self.panel.go_user(user_id)
+        if user is None:
+            return self.screen(chat, "Подписка GO недоступна.",
+                               [[self.back_to_list(chat, page)]], message)
+        usage = user.get("userTraffic") or user
+        devices = self.panel.devices(user_id)
+        squads = ", ".join(squad["name"] for squad in user.get("activeInternalSquads", []))
+        limit = user.get("trafficLimitBytes")
+        device_label = "Данные недоступны"
+        if isinstance(devices, list):
+            models = [
+                " ".join(str(device[key]) for key in ("deviceModel", "platform", "osVersion") if device.get(key))
+                for device in devices[:5]
+            ]
+            details = ", ".join(filter(None, models))[:400]
+            device_label = str(len(devices)) + (f" · {details}" if details else "")
+            if len(devices) > 5:
+                device_label += f" · ещё {len(devices) - 5}"
+        data = [
+            ("ID", user_id),
+            ("Статус", STATUSES.get(user.get("status"), "—")),
+            ("Создана", utc_date(user.get("createdAt"))),
+            ("Действует до", utc_date(user.get("expireAt"))),
+            ("Первое подключение", utc_date(usage.get("firstConnectedAt"))),
+            ("Последнее подключение", utc_date(usage.get("onlineAt"))),
+            ("Трафик за период", f'{traffic(usage.get("usedTrafficBytes"))} / {traffic(limit) if limit != 0 else "без лимита"}'),
+            ("Трафик за всё время", traffic(usage.get("lifetimeUsedTrafficBytes"))),
+            ("Устройства HWID", device_label),
+            ("Внутренние сквады", squads[:600] or "—"),
+        ]
+        if uuid := user.get("externalSquadUuid"):
+            data.append(("Внешний сквад", self.panel.external_squad(uuid)))
+        url = subscription(user)
+        rows = []
+        if url:
+            links = [{"text": "Открыть подписку", "url": url}]
+            if len(url) <= 256:
+                links.append({"text": "Копировать", "copy_text": {"text": url}})
+            rows.append(links)
+        actions = []
+        if user.get("status") != "DISABLED":
+            actions.append(button("Деактивировать", f"action:disable:{user_id}:{page}"))
+        actions.append(button("Удалить", f"action:delete:{user_id}:{page}", "danger"))
+        rows.extend([actions, [self.back_to_list(chat, page), button("Меню", "menu")]])
+        return self.table(chat, user["username"], ("Поле", "Значение"), data, rows, message)
+
+    def confirm_action(self, chat, action, user_id, page, message):
+        self.inputs.pop(chat, None)
+        self.confirmations.pop(chat, None)
+        self.actions.pop(chat, None)
+        user = self.panel.go_user(user_id)
+        if user is None:
+            return self.screen(chat, "Подписка GO недоступна.",
+                               [[self.back_to_list(chat, page)]], message)
+        token = secrets.token_hex(8)
+        self.actions[chat] = (token, action, user_id, page)
+        verb = "Удалить" if action == "delete" else "Деактивировать"
+        return self.screen(chat, f"{verb} подписку {user['username']} (ID {user_id})?", [
+            [button(verb, f"apply:{token}", "danger"),
+             button("Отмена", f"card:{user_id}:{page}")],
+        ], message)
+
+    def apply_action(self, chat, token, message):
+        pending = self.actions.get(chat)
+        if pending is None or pending[0] != token:
+            return self.screen(chat, "Подтверждение устарело.", [[button("Меню", "menu")]], message)
+        del self.actions[chat]
+        _, action, user_id, page = pending
+        try:
+            user = self.panel.change(user_id, action)
+        except ApiError as error:
+            LOG.warning("Account action %s failed for ID %s (%s)", action, user_id, error)
+            return self.screen(chat, "Панель не подтвердила операцию. Обновите карточку.", [
+                [button("Карточка", f"card:{user_id}:{page}"), button("Меню", "menu")],
+            ], message)
+        # Other administrators may have the same subscription in their cached lists.
+        self.views.clear()
+        if user is None:
+            text = "Подписка GO недоступна."
+        elif action == "disable":
+            text = f"Подписка {user['username']} деактивирована."
+        else:
+            text = f"Подписка {user['username']} удалена."
+        return self.screen(chat, text, [
+            [button("Все подписки GO", "all"), button("Меню", "menu")],
+        ], message)
+
     def create(self, chat, code, message):
         pending = self.confirmations.get(chat)
         if pending is None or pending[0] != code:
             return self.screen(chat, "Подтверждение устарело.", [[button("Меню", "menu")]], message)
         del self.confirmations[chat]
-        count = pending[1]
+        _, count, prefix = pending
         squad = self.panel.squad()
         self.screen(chat, f"Создаю учётные записи: 0 из {count}", message=message)
         users, failures = [], []
         last_update = time.monotonic()
         for index in range(1, count + 1):
-            username = f"go_pending_{code}_{index:03d}"
+            username = f"go_{code}_{index:03d}"
             try:
-                users.append(self.panel.create(username, squad))
+                users.append(self.panel.create(username, squad, prefix))
             except ApiError as error:
                 failures.append(username)
                 LOG.warning("Creation failed for %s (%s)", username, error)
@@ -255,9 +454,9 @@ class Bot:
         skipped = count - len(users) - len(failures)
         if skipped:
             title += f"\nПропущено: {skipped}"
-        pending = sum(user["username"].startswith("go_pending_") for user in users)
-        if pending:
-            title += f"\nС временным именем: {pending}"
+        unnamed = sum(user["username"].startswith(f"go_{code}_") for user in users)
+        if unnamed:
+            title += f"\nС временным именем: {unnamed}"
         missing = sum(not subscription(user) for user in users)
         if missing:
             title += f"\nБез ссылки в ответе панели: {missing}"
@@ -285,14 +484,21 @@ class Bot:
             command = value.split(maxsplit=1)[0].split("@")[0] if value else ""
             if command in {"/start", "/menu", "/cancel"}:
                 return self.menu(chat)
-            if chat in self.custom:
+            state = self.inputs.get(chat)
+            if state and state[0] == "count":
                 if value.isascii() and value.isdecimal() and len(value) <= 3:
                     count = int(value)
                     if 1 <= count <= self.max_batch:
-                        self.custom.remove(chat)
-                        return self.confirm(chat, count)
+                        return self.ask_prefix(chat, count)
                 return self.screen(chat, f"Введите целое число от 1 до {self.max_batch}.",
                                    [[button("Отмена", "menu")]])
+            if state and state[0] == "prefix":
+                _, count, token = state
+                prefix = value.lower()
+                if PREFIX.fullmatch(prefix) and value.isascii():
+                    return self.confirm(chat, count, prefix)
+                return self.screen(chat, "Введите от 1 до 16 символов. Первый символ — латинская буква или цифра.",
+                                   [[button("Без префикса", f"default:{token}"), button("Отмена", "menu")]])
             return
         action = callback.get("data", "")
         message_id = message["message_id"]
@@ -300,25 +506,42 @@ class Bot:
             return self.menu(chat, message_id)
         if action == "custom":
             self.confirmations.pop(chat, None)
-            self.custom.add(chat)
+            self.actions.pop(chat, None)
+            self.inputs[chat] = ("count",)
             return self.screen(chat, f"Сколько записей создать? Отправьте число от 1 до {self.max_batch}.",
                                [[button("Отмена", "menu")]], message_id)
         if action.startswith("count:"):
-            self.custom.discard(chat)
-            return self.confirm(chat, int(action.split(":")[1]), message_id)
+            return self.ask_prefix(chat, int(action.split(":")[1]), message_id)
+        if action.startswith("default:"):
+            state = self.inputs.get(chat)
+            if state and state[0] == "prefix" and action.split(":")[1] == state[2]:
+                return self.confirm(chat, state[1], "", message_id)
+            return
         if action.startswith("create:"):
             return self.create(chat, action.split(":")[1], message_id)
-        if action == "active":
-            self.custom.discard(chat)
+        if action in {"active", "all"}:
+            self.inputs.pop(chat, None)
             self.confirmations.pop(chat, None)
-            self.screen(chat, "Загружаю активные подписки GO…", message=message_id)
-            users = list(self.panel.active())
-            return self.results(chat, f"Активные подписки GO: {len(users)}", users, message_id)
+            self.actions.pop(chat, None)
+            self.screen(chat, "Загружаю подписки GO…", message=message_id)
+            users = list(self.panel.users(active_only=action == "active"))
+            title = "Активные подписки GO" if action == "active" else "Все подписки GO"
+            return self.results(chat, f"{title}: {len(users)}", users, message_id)
         if action.startswith("page:"):
+            self.actions.pop(chat, None)
             _, code, index = action.split(":")
             return self.show(chat, code, int(index), message_id)
         if action.startswith("csv:"):
             return self.export(chat, action.split(":")[1])
+        if action.startswith("card:"):
+            _, user_id, page = action.split(":")
+            return self.card(chat, int(user_id), int(page), message_id)
+        if action.startswith("action:"):
+            _, operation, user_id, page = action.split(":")
+            if operation in {"disable", "delete"}:
+                return self.confirm_action(chat, operation, int(user_id), int(page), message_id)
+        if action.startswith("apply:"):
+            return self.apply_action(chat, action.split(":")[1], message_id)
 
     def run(self):
         offset = 0

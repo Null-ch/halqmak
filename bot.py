@@ -237,7 +237,7 @@ class Bot:
             cells = [[{"text": text, "is_header": True} for text in columns]]
             cells.extend([{"text": value if isinstance(value, (dict, list)) else str(value)}
                           for value in row] for row in entries)
-            blocks.append({"type": "table", "cells": cells})
+            blocks.append({"type": "table", "cells": cells, "is_compact": True})
         content = {"blocks": blocks}
         payload = {"chat_id": chat, "rich_message": content, "reply_markup": {"inline_keyboard": rows}}
         try:
@@ -309,10 +309,13 @@ class Bot:
                 link = table_button("Копировать", copy_text={"text": url})
             elif url:
                 link = table_button("Открыть", url=url)
-            row = [name, user_id or "—"]
+            metadata = [f"ID {user_id}"] if user_id else []
             if not created:
-                row.append(STATUSES.get(user.get("status"), "—"))
-            data.append([*row, link])
+                status = STATUSES.get(user.get("status"))
+                if status:
+                    metadata.append(status)
+            account = [name, "\n" + " · ".join(metadata)] if metadata else name
+            data.append([account, link])
         navigation = []
         if index:
             navigation.append(button("←", f"page:{code}:{index - 1}"))
@@ -328,8 +331,7 @@ class Bot:
             details = (*details, f"Страница {index + 1} из {pages}")
         if not entries:
             return self.screen(chat, "\n".join((title, *details)), rows, message)
-        headers = ("Ник", "ID", "Ссылка") if created else ("Ник", "ID", "Статус", "Ссылка")
-        return self.table(chat, title, headers, data, rows, message, details=details)
+        return self.table(chat, title, ("Подписка", "Ссылка"), data, rows, message, details=details)
 
     def results(self, chat, title, users, message=None, *, details=(), created=False):
         code = secrets.token_hex(6)
@@ -385,18 +387,22 @@ class Bot:
         if url:
             links = [table_button("Открыть", url=url)]
             if len(url) <= 256:
-                links.extend(["  ", table_button("Копировать", copy_text={"text": url})])
+                links.extend(["\n", table_button("Копировать", copy_text={"text": url})])
             data.append(("Подписка", links))
         extra_tables = []
         if devices:
             device_rows = [
-                tuple(str(device.get(field) or "—")[:100] for field in ("deviceModel", "platform", "osVersion"))
+                (
+                    str(device.get("deviceModel") or "—")[:100],
+                    "\n".join(str(device[field])[:100] for field in ("platform", "osVersion")
+                              if device.get(field)) or "—",
+                )
                 for device in devices[:100]
             ]
             caption = f"Устройства HWID · {len(devices)}"
             if len(devices) > len(device_rows):
                 caption += f" · показано {len(device_rows)}"
-            extra_tables.append((caption, ("Модель", "Платформа", "Версия ОС"), device_rows))
+            extra_tables.append((caption, ("Модель", "Платформа / ОС"), device_rows))
         else:
             data.append(("Устройства HWID", "Нет устройств" if devices == [] else "Данные недоступны"))
         rows = []

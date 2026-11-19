@@ -283,15 +283,13 @@ class Bot:
         code = secrets.token_hex(8)
         self.confirmations[chat] = (code, count)
         self.screen(chat, f"Создать учётные записи: {count}\nТег и сквад: GO\nСрок в панели: до {self.panel.expiry[:10]}", [
-            [button("Создать", f"create:{code}", "success"), button("Отмена", "menu")],
+            [button("Создать", f"create:{code}", "success"), button("Отмена", "cancel")],
         ], message)
 
     def show(self, chat, code, index, message=None):
         current = self.views.get(chat)
         if current is None or code != current[0]:
-            return self.screen(chat, "Список устарел. Откройте его заново.", [
-                [button("Меню", "menu")],
-            ], message)
+            return self.screen(chat, "Список устарел. Откройте его заново.", message=message)
         _, title, users, details = current
         pages = max(1, (len(users) + PAGE_SIZE - 1) // PAGE_SIZE)
         if not 0 <= index < pages:
@@ -319,9 +317,7 @@ class Bot:
         if navigation:
             rows.append(navigation)
         if users:
-            rows.append([button("Скачать CSV", f"csv:{code}"), button("Меню", "menu")])
-        else:
-            rows.append([button("Меню", "menu")])
+            rows.append([button("Скачать CSV", f"csv:{code}")])
         if pages > 1:
             details = (*details, f"Страница {index + 1} из {pages}")
         if not entries:
@@ -403,7 +399,7 @@ class Bot:
         if user.get("status") != "DISABLED":
             rows.append([button("Деактивировать", f"action:disable:{user_id}:{page}")])
         rows.append([button("Удалить", f"action:delete:{user_id}:{page}", "danger")])
-        rows.append([self.back_to_list(chat, page), button("Меню", "menu")])
+        rows.append([self.back_to_list(chat, page)])
         return self.table(chat, user["username"], ("Поле", "Значение"), data, rows, message,
                           extra_tables=extra_tables)
 
@@ -426,7 +422,7 @@ class Bot:
     def verify_action(self, chat, token, message):
         pending = self.actions.get(chat)
         if pending is None or pending[0] != token or pending[4]:
-            return self.screen(chat, "Подтверждение устарело.", [[button("Меню", "menu")]], message)
+            return self.screen(chat, "Подтверждение устарело.", message=message)
         del self.actions[chat]
         _, action, user_id, page, _ = pending
         user = self.panel.go_user(user_id)
@@ -447,7 +443,7 @@ class Bot:
     def apply_action(self, chat, token, message):
         pending = self.actions.get(chat)
         if pending is None or pending[0] != token or not pending[4]:
-            return self.screen(chat, "Подтверждение устарело.", [[button("Меню", "menu")]], message)
+            return self.screen(chat, "Подтверждение устарело.", message=message)
         del self.actions[chat]
         _, action, user_id, page, _ = pending
         try:
@@ -455,7 +451,7 @@ class Bot:
         except ApiError as error:
             LOG.warning("Account action %s failed for ID %s (%s)", action, user_id, error)
             return self.screen(chat, "Панель не подтвердила операцию. Обновите карточку.", [
-                [button("Карточка", f"card:{user_id}:{page}"), button("Меню", "menu")],
+                [button("Карточка", f"card:{user_id}:{page}")],
             ], message)
         # Other administrators may have the same subscription in their cached lists.
         self.views.clear()
@@ -465,14 +461,12 @@ class Bot:
             text = f"Подписка {user['username']} деактивирована."
         else:
             text = f"Подписка {user['username']} удалена."
-        return self.screen(chat, text, [
-            [button("Все подписки GO", "all"), button("Меню", "menu")],
-        ], message)
+        return self.screen(chat, text, message=message)
 
     def create(self, chat, code, message):
         pending = self.confirmations.get(chat)
         if pending is None or pending[0] != code:
-            return self.screen(chat, "Подтверждение устарело.", [[button("Меню", "menu")]], message)
+            return self.screen(chat, "Подтверждение устарело.", message=message)
         del self.confirmations[chat]
         _, count = pending
         squad = self.panel.squad()
@@ -539,17 +533,21 @@ class Bot:
                     if 1 <= count <= self.max_batch:
                         return self.confirm(chat, count)
                 return self.screen(chat, f"Введите целое число от 1 до {self.max_batch}.",
-                                   [[button("Отмена", "menu")]])
+                                   [[button("Отмена", "cancel")]])
             if action is None:
                 return
         if action == "menu":
             return self.menu(chat)
+        if action == "cancel":
+            self.inputs.pop(chat, None)
+            self.confirmations.pop(chat, None)
+            return self.screen(chat, "Создание отменено.", message=message_id)
         if action == "custom":
             self.confirmations.pop(chat, None)
             self.actions.pop(chat, None)
             self.inputs[chat] = ("count",)
             return self.screen(chat, f"Сколько записей создать? Отправьте число от 1 до {self.max_batch}.",
-                               [[button("Отмена", "menu")]], message_id)
+                               [[button("Отмена", "cancel")]], message_id)
         if action.startswith("count:"):
             return self.confirm(chat, int(action.split(":")[1]), message_id)
         if action.startswith("create:"):
@@ -606,7 +604,7 @@ class Bot:
                     if chat in self.admins:
                         try:
                             self.screen(chat, "Не удалось завершить операцию. Проверьте активные подписки GO.",
-                                        [[button("Активные подписки GO", "active"), button("Меню", "menu")]])
+                                        [[button("Активные подписки GO", "active")]])
                         except ApiError:
                             pass
 

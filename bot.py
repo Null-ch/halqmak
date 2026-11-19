@@ -412,19 +412,40 @@ class Bot:
             return self.screen(chat, "Подписка GO недоступна.",
                                [[self.back_to_list(chat, page)]], message)
         token = secrets.token_hex(8)
-        self.actions[chat] = (token, action, user_id, page)
+        self.actions[chat] = (token, action, user_id, page, False)
         verb = "Удалить" if action == "delete" else "Деактивировать"
         return self.screen(chat, f"{verb} подписку {user['username']} (ID {user_id})?", [
-            [button(verb, f"apply:{token}", "danger"),
+            [button("Продолжить", f"verify:{token}"),
+             button("Отмена", f"card:{user_id}:{page}")],
+        ], message)
+
+    def verify_action(self, chat, token, message):
+        pending = self.actions.get(chat)
+        if pending is None or pending[0] != token or pending[4]:
+            return self.screen(chat, "Подтверждение устарело.", [[button("Меню", "menu")]], message)
+        del self.actions[chat]
+        _, action, user_id, page, _ = pending
+        user = self.panel.go_user(user_id)
+        if user is None:
+            return self.screen(chat, "Подписка GO недоступна.",
+                               [[self.back_to_list(chat, page)]], message)
+        final_token = secrets.token_hex(8)
+        self.actions[chat] = (final_token, action, user_id, page, True)
+        verb = "удалить" if action == "delete" else "деактивировать"
+        text = f"Вы точно хотите {verb} подписку {user['username']} (ID {user_id})?"
+        if action == "delete":
+            text += "\nУдаление нельзя отменить."
+        return self.screen(chat, text, [
+            [button(f"Да, {verb}", f"apply:{final_token}", "danger"),
              button("Отмена", f"card:{user_id}:{page}")],
         ], message)
 
     def apply_action(self, chat, token, message):
         pending = self.actions.get(chat)
-        if pending is None or pending[0] != token:
+        if pending is None or pending[0] != token or not pending[4]:
             return self.screen(chat, "Подтверждение устарело.", [[button("Меню", "menu")]], message)
         del self.actions[chat]
-        _, action, user_id, page = pending
+        _, action, user_id, page, _ = pending
         try:
             user = self.panel.change(user_id, action)
         except ApiError as error:
@@ -547,6 +568,8 @@ class Bot:
             _, operation, user_id, page = action.split(":")
             if operation in {"disable", "delete"}:
                 return self.confirm_action(chat, operation, int(user_id), int(page), message_id)
+        if action.startswith("verify:"):
+            return self.verify_action(chat, action.split(":")[1], message_id)
         if action.startswith("apply:"):
             return self.apply_action(chat, action.split(":")[1], message_id)
 

@@ -291,7 +291,7 @@ class Bot:
             return self.screen(chat, "Список устарел. Откройте его заново.", [
                 [button("Меню", "menu")],
             ], message)
-        _, title, users, details, created = current
+        _, title, users, details = current
         pages = max(1, (len(users) + PAGE_SIZE - 1) // PAGE_SIZE)
         if not 0 <= index < pages:
             return
@@ -309,13 +309,7 @@ class Bot:
                 link = table_button("Копировать", copy_text={"text": url})
             elif url:
                 link = table_button("Открыть", url=url)
-            metadata = [f"ID {user_id}"] if user_id else []
-            if not created:
-                status = STATUSES.get(user.get("status"))
-                if status:
-                    metadata.append(status)
-            account = [name, "\n" + " · ".join(metadata)] if metadata else name
-            data.append([account, link])
+            data.append([name, link])
         navigation = []
         if index:
             navigation.append(button("←", f"page:{code}:{index - 1}"))
@@ -333,9 +327,9 @@ class Bot:
             return self.screen(chat, "\n".join((title, *details)), rows, message)
         return self.table(chat, title, ("Подписка", "Ссылка"), data, rows, message, details=details)
 
-    def results(self, chat, title, users, message=None, *, details=(), created=False):
+    def results(self, chat, title, users, message=None, *, details=()):
         code = secrets.token_hex(6)
-        self.views[chat] = (code, title, users, details, created)
+        self.views[chat] = (code, title, users, details)
         self.show(chat, code, 0, message)
 
     def export(self, chat, code):
@@ -353,7 +347,7 @@ class Bot:
     def back_to_list(self, chat, page):
         current = self.views.get(chat)
         if current:
-            code, _, users, _, _ = current
+            code, _, users, _ = current
             last = max(0, (len(users) - 1) // PAGE_SIZE)
             return button("← К списку", f"page:{code}:{min(page, last)}")
         return button("Все подписки GO", "all")
@@ -511,7 +505,7 @@ class Bot:
         missing = sum(not subscription(user) for user in users)
         if missing:
             details.append(f"Без ссылки в ответе панели: {missing}")
-        self.results(chat, title, users, message, details=details, created=True)
+        self.results(chat, title, users, message, details=details)
 
     def dispatch(self, update):
         callback = update.get("callback_query")
